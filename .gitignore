@@ -1,0 +1,67 @@
+# --- Python Environment & Compiled Files ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+backend/envir/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Environment Variables (CRITICAL) ---
+# Never commit your secrets
+.env
+.env.*
+!.env.example
+
+# --- FastAPI/Project Specific ---
+# If using database migrations (e.g., Alembic)
+# Ensure migrations/versions are kept, but ignore specific database files
+*.db
+*.sqlite3
+
+# --- Testing & Coverage ---
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# --- IDEs & Editors ---
+# PyCharm / IntelliJ
+.idea/
+# VS Code
+.vscode/
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# --- Package Managers ---
+# Keep your lock files for reproducible builds, but ignore local config
+.pdm-python
+.python-version
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db
