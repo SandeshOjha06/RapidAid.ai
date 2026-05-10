@@ -7,7 +7,7 @@
 
 ---
 
-## 🌍 The Problem (Context: Nepal)
+##  The Problem (Context: Nepal)
 
 In highly congested cities like Kathmandu, emergency medical response suffers from critical bottlenecks:
 
