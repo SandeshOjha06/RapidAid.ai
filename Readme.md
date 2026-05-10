@@ -9,7 +9,7 @@
 
 ##  The Problem (Context: Nepal)
 
-In highly congested cities like Kathmandu, emergency medical response suffers from critical bottlenecks:
+Inp highly congested cities like Kathmandu, emergency medical response suffers from critical bottlenecks:
 
 1. **Manual Dispatch:** Call centers rely on human estimation rather than real-time data.
 2. **Blind Routing:** Ambulances get stuck in traffic due to a lack of dynamic, predictive routing.
