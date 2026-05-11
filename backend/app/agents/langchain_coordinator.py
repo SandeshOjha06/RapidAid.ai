@@ -4,7 +4,7 @@ from typing import Dict, Any
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
-from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
 
 from app.core.config import settings
 from app.models.db_models import Emergency, AgentLog
