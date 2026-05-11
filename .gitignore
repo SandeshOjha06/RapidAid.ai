@@ -26,7 +26,10 @@ wheels/
 *.egg
 
 # --- Environment Variables (CRITICAL) ---
-/backend/.env
+# Never commit your secrets
+.env
+.env.*
+/backend/.env.example
 
 # --- FastAPI/Project Specific ---
 # If using database migrations (e.g., Alembic)
