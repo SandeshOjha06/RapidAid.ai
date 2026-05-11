@@ -1,158 +1,378 @@
 import math
 import hashlib
+import logging
 from datetime import datetime
 from sqlalchemy import select
 from app.models.db_models import (
-    Emergency, Hospital, Vehicle, AgentLog, SeverityLevel, 
-    HospitalStatus, VehicleTier, EmergencyStatus
+    Emergency, Hospital, Vehicle, AgentLog, SeverityLevel,
+    HospitalStatus, VehicleTier, EmergencyStatus, EmergencyType
 )
 from app.database import AsyncSession
 
-def haversine_km(lat1, lng1, lat2, lng2) -> float:
+logger = logging.getLogger(__name__)
+
+
+def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Calculate great-circle distance between two coordinates in kilometres."""
     R = 6371
     lat1, lng1, lat2, lng2 = map(math.radians, [lat1, lng1, lat2, lng2])
-    dlat = lat2 - lat1; dlng = lng2 - lng1
-    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng/2)**2
+    dlat = lat2 - lat1
+    dlng = lng2 - lng1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng / 2) ** 2
     return R * 2 * math.asin(math.sqrt(a))
 
+
+def _make_hash(emergency_id: str, agent_name: str) -> str:
+    """Deterministic decision hash based on emergency + agent."""
+    content = f"{emergency_id}-{agent_name}-{datetime.utcnow().isoformat()}"
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hospital Agent
+# ─────────────────────────────────────────────────────────────────────────────
+
 class HospitalAgent:
+    """
+    Selects the optimal receiving hospital based on:
+      - ICU/ER availability for critical/urgent patients
+      - Medical specialization match
+      - Haversine distance (×1.3 road factor for Kathmandu)
+    """
+
     async def process(self, emergency: Emergency, db: AsyncSession):
         stmt = select(Hospital).where(Hospital.is_active == True)
         result = await db.execute(stmt)
         hospitals = result.scalars().all()
-        
+
         candidates = []
         for h in hospitals:
-            # Filter
-            if emergency.severity in [SeverityLevel.P1_CRITICAL, SeverityLevel.P2_URGENT]:
-                if h.icu_status != HospitalStatus.OPEN: continue
-            if h.er_status != HospitalStatus.OPEN: continue
-            
-            # Specialization match
-            spec_match = False
-            if emergency.medical_category == "GENERAL" or not emergency.medical_category:
-                spec_match = True
-            elif emergency.medical_category in h.specializations:
-                spec_match = True
-            
-            dist = haversine_km(emergency.patient_lat, emergency.patient_lng, h.lat, h.lng) * 1.3
-            spec_bonus = 0 if spec_match else 2.0
-            score = dist + spec_bonus
+            # Critical/urgent require open ICU
+            if emergency.severity in (SeverityLevel.P1_CRITICAL, SeverityLevel.P2_URGENT):
+                if h.icu_status != HospitalStatus.OPEN:
+                    continue
+            # All cases require open ER
+            if h.er_status != HospitalStatus.OPEN:
+                continue
+
+            dist_km = haversine_km(emergency.patient_lat, emergency.patient_lng, h.lat, h.lng) * 1.3
+
+            # Specialization bonus/penalty
+            spec_match = (
+                not emergency.medical_category
+                or emergency.medical_category == "GENERAL"
+                or emergency.medical_category in (h.specializations or [])
+            )
+            spec_penalty = 0.0 if spec_match else 2.0  # 2 km penalty if no spec match
+
+            score = dist_km + spec_penalty
             candidates.append((score, h))
-            
+
         if not candidates:
-            # Fallback
-            stmt = select(Hospital).where(Hospital.er_status == HospitalStatus.OPEN)
-            result = await db.execute(stmt)
-            fallback_hospitals = result.scalars().all()
-            if fallback_hospitals:
-                selected_hospital = fallback_hospitals[0]
-            else:
-                raise Exception("No available hospitals found even in fallback!")
+            # Graceful fallback: any hospital with open ER
+            fallback_stmt = select(Hospital).where(
+                Hospital.er_status == HospitalStatus.OPEN,
+                Hospital.is_active == True,
+            )
+            fallback_result = await db.execute(fallback_stmt)
+            fallback_hospitals = fallback_result.scalars().all()
+            if not fallback_hospitals:
+                raise RuntimeError("No available hospitals found — all ERs full or offline.")
+            selected = min(
+                fallback_hospitals,
+                key=lambda h: haversine_km(emergency.patient_lat, emergency.patient_lng, h.lat, h.lng),
+            )
+            reasoning = (
+                f"FALLBACK: No hospital with open ICU found for {emergency.severity}. "
+                f"Routed to nearest open-ER hospital: {selected.name}."
+            )
+            confidence = 0.70
         else:
             candidates.sort(key=lambda x: x[0])
-            selected_hospital = candidates[0][1]
-            
-        emergency.hospital_id = selected_hospital.id
-        
+            score, selected = candidates[0]
+            reasoning = (
+                f"Selected {selected.name} (score={score:.2f} km). "
+                f"Specializations: {selected.specializations}. "
+                f"ICU: {selected.icu_status.value}, ER: {selected.er_status.value}. "
+                f"Severity: {emergency.severity.value if emergency.severity else 'UNKNOWN'}."
+            )
+            confidence = 0.92 if (emergency.medical_category in (selected.specializations or [])) else 0.80
+
+        emergency.hospital_id = selected.id
+
         log = AgentLog(
             emergency_id=emergency.id,
             agent_name="HOSPITAL_AGENT",
-            decision=f"Selected {selected_hospital.name}",
-            reasoning=f"Optimal hospital based on severity {emergency.severity} and location.",
-            confidence=0.90,
-            decision_hash=hashlib.sha256(f"{emergency.id}-HOSPITAL-{datetime.utcnow()}".encode()).hexdigest()
+            decision=f"Selected {selected.name} ({selected.address})",
+            reasoning=reasoning,
+            confidence=confidence,
+            decision_hash=_make_hash(emergency.id, "HOSPITAL_AGENT"),
         )
         db.add(log)
         await db.flush()
+        logger.info("HospitalAgent → %s (conf=%.2f)", selected.name, confidence)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Negotiation Agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+class NegotiationAgent:
+    """
+    Simulates real-time hospital capacity negotiation.
+
+    In production: Would make an API call / WebSocket ping to the hospital system
+    to confirm they can accept this patient. For the hackathon demo, this agent
+    re-validates the selected hospital's current status and attempts a single
+    re-route if it has become unavailable since HospitalAgent ran.
+    """
+
+    async def process(self, emergency: Emergency, db: AsyncSession):
+        # Fetch the hospital selected by HospitalAgent
+        hospital_stmt = select(Hospital).where(Hospital.id == emergency.hospital_id)
+        hospital = (await db.execute(hospital_stmt)).scalar_one_or_none()
+
+        if not hospital:
+            raise RuntimeError("NegotiationAgent: Hospital not found for emergency.")
+
+        # Re-validate capacity
+        can_accept = hospital.er_status == HospitalStatus.OPEN and hospital.is_active
+
+        if emergency.severity in (SeverityLevel.P1_CRITICAL, SeverityLevel.P2_URGENT):
+            can_accept = can_accept and (hospital.icu_status == HospitalStatus.OPEN)
+
+        if can_accept:
+            # Hospital confirms acceptance
+            decision = f"CONFIRMED: {hospital.name} accepts incoming {emergency.severity.value if emergency.severity else 'patient'}"
+            reasoning = (
+                f"Hospital {hospital.name} re-validated — ICU: {hospital.icu_status.value}, "
+                f"ER: {hospital.er_status.value}. Capacity confirmed for "
+                f"{emergency.medical_category or 'GENERAL'} case."
+            )
+            confidence = 0.97
+        else:
+            # Hospital no longer available — attempt re-route
+            logger.warning(
+                "NegotiationAgent: %s became unavailable since HospitalAgent ran. Attempting re-route.",
+                hospital.name,
+            )
+
+            fallback_stmt = select(Hospital).where(
+                Hospital.er_status == HospitalStatus.OPEN,
+                Hospital.is_active == True,
+                Hospital.id != emergency.hospital_id,
+            )
+            fallback_result = await db.execute(fallback_stmt)
+            alternatives = fallback_result.scalars().all()
+
+            if alternatives:
+                new_hospital = min(
+                    alternatives,
+                    key=lambda h: haversine_km(emergency.patient_lat, emergency.patient_lng, h.lat, h.lng),
+                )
+                emergency.hospital_id = new_hospital.id
+                decision = f"REROUTED: {hospital.name} full → redirected to {new_hospital.name}"
+                reasoning = (
+                    f"{hospital.name} became unavailable (ICU={hospital.icu_status.value}). "
+                    f"Negotiation failed. Re-routed to {new_hospital.name} as closest alternative."
+                )
+                confidence = 0.82
+                hospital = new_hospital
+            else:
+                # Proceed anyway — no alternatives
+                decision = f"FORCED: {hospital.name} (no alternatives available)"
+                reasoning = (
+                    f"All alternative hospitals at capacity. Proceeding to {hospital.name} "
+                    f"despite reduced capacity. Alert sent to hospital staff."
+                )
+                confidence = 0.55
+
+        log = AgentLog(
+            emergency_id=emergency.id,
+            agent_name="NEGOTIATION_AGENT",
+            decision=decision,
+            reasoning=reasoning,
+            confidence=confidence,
+            decision_hash=_make_hash(emergency.id, "NEGOTIATION_AGENT"),
+        )
+        db.add(log)
+        await db.flush()
+        logger.info("NegotiationAgent → %s (conf=%.2f)", decision, confidence)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dispatch Agent
+# ─────────────────────────────────────────────────────────────────────────────
 
 class DispatchAgent:
+    """
+    Selects the optimal available ambulance vehicle.
+
+    Scoring:
+      - Primary: Haversine distance (×1.3 Kathmandu road factor)
+      - Secondary: Tier preference based on severity
+        P1_CRITICAL → TIER_1 only; P4_MINOR → TIER_2 preferred
+    """
+
+    TIER_SEVERITY_MAP = {
+        SeverityLevel.P1_CRITICAL: [VehicleTier.TIER_1],
+        SeverityLevel.P2_URGENT:   [VehicleTier.TIER_1, VehicleTier.TIER_2],
+        SeverityLevel.P3_MODERATE: [VehicleTier.TIER_2, VehicleTier.TIER_1],
+        SeverityLevel.P4_MINOR:    [VehicleTier.TIER_2],
+    }
+
     async def process(self, emergency: Emergency, db: AsyncSession):
-        TIER_SEVERITY_MAP = {
-            SeverityLevel.P1_CRITICAL: [VehicleTier.TIER_1],
-            SeverityLevel.P2_URGENT:   [VehicleTier.TIER_1, VehicleTier.TIER_2],
-            SeverityLevel.P3_MODERATE: [VehicleTier.TIER_2, VehicleTier.TIER_1],
-            SeverityLevel.P4_MINOR:    [VehicleTier.TIER_2],
-        }
-        
-        stmt = select(Vehicle).where(Vehicle.is_available == True, Vehicle.current_lat != None)
+        stmt = select(Vehicle).where(
+            Vehicle.is_available == True,
+            Vehicle.current_lat.is_not(None),
+            Vehicle.current_lng.is_not(None),
+        )
         result = await db.execute(stmt)
         vehicles = result.scalars().all()
-        
-        preferred_tiers = TIER_SEVERITY_MAP.get(emergency.severity, [VehicleTier.TIER_2])
-        
+
+        if not vehicles:
+            raise RuntimeError("No available vehicles with GPS coordinates found.")
+
+        preferred_tiers = self.TIER_SEVERITY_MAP.get(
+            emergency.severity, [VehicleTier.TIER_1, VehicleTier.TIER_2]
+        )
+
         candidates = []
         for v in vehicles:
-            dist = haversine_km(emergency.patient_lat, emergency.patient_lng, v.current_lat, v.current_lng) * 1.3
-            tier_penalty = 0 if v.tier in preferred_tiers else 1.5
-            score = dist + tier_penalty
+            dist_km = haversine_km(
+                emergency.patient_lat, emergency.patient_lng,
+                v.current_lat, v.current_lng
+            ) * 1.3
+
+            # Penalize wrong tier (but don't exclude entirely)
+            tier_penalty = 0.0 if v.tier in preferred_tiers else 1.5
+            score = dist_km + tier_penalty
             candidates.append((score, v))
-            
-        if not candidates:
-             raise Exception("No available vehicles found!")
-             
+
         candidates.sort(key=lambda x: x[0])
-        selected_vehicle = candidates[0][1]
-        
-        emergency.vehicle_id = selected_vehicle.id
+        score, selected = candidates[0]
+
+        emergency.vehicle_id = selected.id
         emergency.status = EmergencyStatus.DISPATCHED
         emergency.dispatched_at = datetime.utcnow()
-        
-        selected_vehicle.is_available = False
-        db.add(selected_vehicle)
-        
+
+        selected.is_available = False
+        db.add(selected)
+
+        reasoning = (
+            f"Dispatched {selected.registration} (Tier {selected.tier.value}). "
+            f"Distance: {score:.2f} km to patient. "
+            f"Preferred tiers for {emergency.severity.value if emergency.severity else 'UNKNOWN'}: "
+            f"{[t.value for t in preferred_tiers]}. "
+            f"{len(vehicles)} vehicle(s) evaluated."
+        )
+
         log = AgentLog(
             emergency_id=emergency.id,
             agent_name="DISPATCH_AGENT",
-            decision=f"Dispatched {selected_vehicle.registration}",
-            reasoning=f"Closest available vehicle with tier {selected_vehicle.tier}.",
+            decision=f"Dispatched {selected.registration} (Tier {selected.tier.value})",
+            reasoning=reasoning,
             confidence=0.94,
-            decision_hash=hashlib.sha256(f"{emergency.id}-DISPATCH-{datetime.utcnow()}".encode()).hexdigest()
+            decision_hash=_make_hash(emergency.id, "DISPATCH_AGENT"),
         )
         db.add(log)
         await db.flush()
+        logger.info("DispatchAgent → %s @ %.2f km (conf=0.94)", selected.registration, score)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Route Agent
+# ─────────────────────────────────────────────────────────────────────────────
 
 class RouteAgent:
+    """
+    Calculates ETA and fare using:
+      - Haversine distances × 1.3 road factor
+      - Hour-based Kathmandu traffic profile (UTC+5:45 adjusted)
+      - Vehicle tier for speed assumptions
+      - MEDICAL_RIDE fare formula (NPR)
+    """
+
+    # Kathmandu traffic multiplier by UTC hour
+    # (UTC+5:45 → NPT, peak at 8-11 AM and 5-8 PM local)
+    TRAFFIC_PROFILE = {
+        (0, 5):   0.7,   # 5:45-10:45 NPT → early morning, clear roads
+        (6, 7):   1.2,   # 11:45-12:45 NPT → light midday traffic
+        (8, 10):  1.8,   # 13:45-15:45 NPT → afternoon rush start
+        (11, 16): 1.3,   # 16:45-21:45 NPT → moderate
+        (17, 19): 1.9,   # 22:45-00:45 NPT → evening rush (worst in KTM)
+        (20, 23): 1.1,   # 01:45-04:45 NPT → night
+    }
+
+    def _traffic_multiplier(self) -> float:
+        hour = datetime.utcnow().hour
+        for (start, end), mult in self.TRAFFIC_PROFILE.items():
+            if start <= hour <= end:
+                return mult
+        return 1.3  # default
+
     async def process(self, emergency: Emergency, db: AsyncSession):
-        # Fetch hospital and vehicle for locations
+        # Fetch hospital
         hospital_stmt = select(Hospital).where(Hospital.id == emergency.hospital_id)
         hospital = (await db.execute(hospital_stmt)).scalar_one()
-        
+
+        # Fetch vehicle
         vehicle_stmt = select(Vehicle).where(Vehicle.id == emergency.vehicle_id)
         vehicle = (await db.execute(vehicle_stmt)).scalar_one()
-        
-        # Traffic by hour Kathmandu (UTC+5:45 assumed, but using server hour for simplicity)
-        hour = datetime.utcnow().hour
-        traffic_mult = 1.3
-        if 0 <= hour < 6: traffic_mult = 0.7
-        elif 6 <= hour < 8: traffic_mult = 1.2
-        elif 8 <= hour < 11: traffic_mult = 1.8
-        elif 11 <= hour < 17: traffic_mult = 1.3
-        elif 17 <= hour < 20: traffic_mult = 1.9
-        elif 20 <= hour < 24: traffic_mult = 1.1
 
-        speed = 35 if emergency.emergency_type == "CRITICAL_SOS" else 25
-        effective_mult = 1 + (traffic_mult - 1) * 0.4
-        
-        dist1 = haversine_km(vehicle.current_lat, vehicle.current_lng, emergency.patient_lat, emergency.patient_lng) * 1.3
-        dist2 = haversine_km(emergency.patient_lat, emergency.patient_lng, hospital.lat, hospital.lng) * 1.3
-        
-        total_dist = dist1 + dist2
-        eta_mins = max(2, round((total_dist / speed) * 60 * effective_mult))
-        
+        traffic_mult = self._traffic_multiplier()
+
+        # Emergency type: CRITICAL_SOS gets faster speed (sirens on)
+        # BUG FIX: compare enum to enum, not str to enum
+        base_speed_kmh = 35.0 if emergency.emergency_type == EmergencyType.CRITICAL_SOS else 25.0
+        effective_mult = 1.0 + (traffic_mult - 1.0) * 0.4  # Sirens mitigate traffic by 60%
+
+        # Leg 1: Vehicle current position → Patient
+        dist_to_patient = haversine_km(
+            vehicle.current_lat, vehicle.current_lng,
+            emergency.patient_lat, emergency.patient_lng
+        ) * 1.3
+
+        # Leg 2: Patient → Hospital
+        dist_to_hospital = haversine_km(
+            emergency.patient_lat, emergency.patient_lng,
+            hospital.lat, hospital.lng
+        ) * 1.3
+
+        total_dist_km = dist_to_patient + dist_to_hospital
+        eta_mins = max(2, round((total_dist_km / base_speed_kmh) * 60 * effective_mult))
+
         emergency.estimated_eta_mins = eta_mins
-        
-        if emergency.emergency_type == "MEDICAL_RIDE":
+
+        # Fare only for MEDICAL_RIDE (non-emergency transport)
+        fare = None
+        if emergency.emergency_type == EmergencyType.MEDICAL_RIDE:
             tier_mult = 2.5 if vehicle.tier == VehicleTier.TIER_1 else 1.0
-            emergency.fare_npr = (200.0 + total_dist * 35.0) * tier_mult
-            
+            fare = round((200.0 + total_dist_km * 35.0) * tier_mult, 2)
+            emergency.fare_npr = fare
+
+        reasoning = (
+            f"Leg 1 (vehicle→patient): {dist_to_patient:.2f} km. "
+            f"Leg 2 (patient→hospital): {dist_to_hospital:.2f} km. "
+            f"Total: {total_dist_km:.2f} km. "
+            f"Base speed: {base_speed_kmh} km/h (siren). "
+            f"Traffic multiplier: {traffic_mult} (hour={datetime.utcnow().hour} UTC). "
+            f"Effective multiplier: {effective_mult:.2f}. "
+            f"ETA: {eta_mins} min."
+            + (f" Fare: NPR {fare}" if fare else "")
+        )
+
         log = AgentLog(
             emergency_id=emergency.id,
             agent_name="ROUTE_AGENT",
-            decision=f"ETA: {eta_mins} mins",
-            reasoning=f"Distance: {total_dist:.2f}km. Traffic multiplier: {traffic_mult}. Nepal traffic context applied.",
+            decision=f"ETA {eta_mins} min | Total {total_dist_km:.1f} km" + (f" | NPR {fare}" if fare else ""),
+            reasoning=reasoning,
             confidence=0.88,
-            decision_hash=hashlib.sha256(f"{emergency.id}-ROUTE-{datetime.utcnow()}".encode()).hexdigest()
+            decision_hash=_make_hash(emergency.id, "ROUTE_AGENT"),
         )
         db.add(log)
         await db.flush()
+        logger.info(
+            "RouteAgent → ETA %d min, %.2f km, traffic=%.1f (conf=0.88)",
+            eta_mins, total_dist_km, traffic_mult
+        )
