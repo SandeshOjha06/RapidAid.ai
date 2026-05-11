@@ -27,4 +27,7 @@ python-dotenv==1.0.1
 
 # ── AI / ML ────────────────────────────────────────────────────────────────────
 groq>=0.9.0                  # Groq API for LLaMA 3.3 Triage, Agent processing
+langchain>=0.2.0             # LangChain core
+langchain-groq>=0.1.0        # LangChain Groq integration
+langchain-community>=0.2.0   # LangChain community tools
 Pillow>=10.0.0               # Image preprocessing for future YOLO11 integration
