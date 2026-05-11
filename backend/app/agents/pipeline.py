@@ -15,7 +15,7 @@ import logging
 import uuid
 from datetime import datetime
 
-from app.agents.gemini_triage import SmartTriageAgent
+from app.agents.smart_triage import SmartTriageAgent
 from app.agents.agents import HospitalAgent, NegotiationAgent, DispatchAgent, RouteAgent
 from app.models.db_models import Emergency, EmergencyStatus
 from app.models.schemas import SOSRequest

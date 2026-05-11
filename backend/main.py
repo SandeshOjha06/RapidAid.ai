@@ -45,15 +45,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️  Could not seed demo data: {e}")
 
-    gemini_status = (
-        "🤖 Gemini 1.5 Flash enabled"
-        if settings.GEMINI_API_KEY
-        else "📋 Rule-based triage (set GEMINI_API_KEY to enable AI triage)"
+    groq_status = (
+        "🤖 Groq LLM (LLaMA 3.3) enabled"
+        if settings.GROQ_API_KEY
+        else "📋 Rule-based triage (set GROQ_API_KEY to enable AI triage)"
     )
     print(f"\n🚀 {settings.APP_NAME} started → http://localhost:8000")
     print(f"   📚 Swagger UI  : http://localhost:8000/docs")
     print(f"   🔧 ReDoc       : http://localhost:8000/redoc")
-    print(f"   🧠 Triage mode : {gemini_status}\n")
+    print(f"   🧠 Triage mode : {groq_status}\n")
 
     yield
 

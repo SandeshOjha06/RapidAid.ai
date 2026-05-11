@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     # ── External APIs ─────────────────────────────────────────────────────────
-    GEMINI_API_KEY: str = ""   # Google Gemini 1.5 Flash — leave empty to use rule-based triage
+    GROQ_API_KEY:   str = ""      # Groq API for LLaMA 3.3 Triage & reasoning (leave empty to use rule-based fallback)
     ORS_API_KEY:    str = "demo"  # OpenRouteService (for future turn-by-turn routing)
 
     # ── App Behaviour ─────────────────────────────────────────────────────────

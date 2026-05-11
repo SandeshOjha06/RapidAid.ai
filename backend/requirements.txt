@@ -26,5 +26,5 @@ aiofiles==23.2.1
 python-dotenv==1.0.1
 
 # ── AI / ML ────────────────────────────────────────────────────────────────────
-google-generativeai>=0.7.0   # Gemini 1.5 Flash triage (optional — graceful fallback)
+groq>=0.9.0                  # Groq API for LLaMA 3.3 Triage, Agent processing
 Pillow>=10.0.0               # Image preprocessing for future YOLO11 integration

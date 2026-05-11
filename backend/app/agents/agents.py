@@ -68,6 +68,54 @@ class HospitalAgent:
             score = dist_km + spec_penalty
             candidates.append((score, h))
 
+        # --- LLM + Web Search Enhancement ---
+        web_results_text = "No web search data used."
+        confidence = 0.80
+        from app.agents.web_search import search_nearest_hospitals_web
+        from app.agents.groq_client import groq_client
+
+        try:
+            # Check if web search might yield better unknown local options (just for context)
+            web_hospitals = await search_nearest_hospitals_web(emergency.patient_lat, emergency.patient_lng, "hospital")
+            if web_hospitals:
+                web_names = [wh["name"] for wh in web_hospitals]
+                web_results_text = f"Found local nearby hospitals via OpenStreetMap: {', '.join(web_names)}."
+
+            if candidates and groq_client.is_available:
+                # Let LLM verify if the top DB candidate is the best choice based on severity and local knowledge
+                candidates.sort(key=lambda x: x[0])
+                top_score, top_h = candidates[0]
+                
+                prompt = f"""
+                You are evaluating hospital assignments.
+                Emergency Severity: {emergency.severity.value if emergency.severity else 'UNKNOWN'}
+                Category: {emergency.medical_category}
+                
+                Top Database Candidate: {top_h.name} (Distance: {top_score:.2f} km)
+                Specializations: {top_h.specializations}
+                ICU Status: {top_h.icu_status.value}, ER Status: {top_h.er_status.value}
+                
+                Web Context (Nearest real-world): {web_results_text}
+                
+                Is {top_h.name} the most appropriate choice given the medical category and ICU requirement?
+                Respond with JSON: {{"decision": "Valid", "reasoning": "...", "confidence": 0.95}}
+                """
+                response = await groq_client.chat(
+                    system_prompt="You are RapidAid's Hospital Selection Agent.",
+                    user_message=prompt,
+                    model="llama-3.1-8b-instant"
+                )
+                if response:
+                    llm_data = groq_client.extract_json(response)
+                    if llm_data:
+                        confidence = float(llm_data.get("confidence", 0.92))
+                        web_results_text += f" LLM Verification: {llm_data.get('reasoning', 'Verified')}"
+                        
+        except Exception as e:
+            logger.warning("Hospital Agent LLM/Web enhancement failed: %s", e)
+
+        # --- End LLM ---
+
         if not candidates:
             # Graceful fallback: any hospital with open ER
             fallback_stmt = select(Hospital).where(
@@ -84,7 +132,7 @@ class HospitalAgent:
             )
             reasoning = (
                 f"FALLBACK: No hospital with open ICU found for {emergency.severity}. "
-                f"Routed to nearest open-ER hospital: {selected.name}."
+                f"Routed to nearest open-ER hospital: {selected.name}. {web_results_text}"
             )
             confidence = 0.70
         else:
@@ -94,7 +142,8 @@ class HospitalAgent:
                 f"Selected {selected.name} (score={score:.2f} km). "
                 f"Specializations: {selected.specializations}. "
                 f"ICU: {selected.icu_status.value}, ER: {selected.er_status.value}. "
-                f"Severity: {emergency.severity.value if emergency.severity else 'UNKNOWN'}."
+                f"Severity: {emergency.severity.value if emergency.severity else 'UNKNOWN'}. "
+                f"Web Context: {web_results_text}"
             )
             confidence = 0.92 if (emergency.medical_category in (selected.specializations or [])) else 0.80
 
@@ -323,24 +372,45 @@ class RouteAgent:
         traffic_mult = self._traffic_multiplier()
 
         # Emergency type: CRITICAL_SOS gets faster speed (sirens on)
-        # BUG FIX: compare enum to enum, not str to enum
         base_speed_kmh = 35.0 if emergency.emergency_type == EmergencyType.CRITICAL_SOS else 25.0
         effective_mult = 1.0 + (traffic_mult - 1.0) * 0.4  # Sirens mitigate traffic by 60%
 
-        # Leg 1: Vehicle current position → Patient
-        dist_to_patient = haversine_km(
-            vehicle.current_lat, vehicle.current_lng,
+        # --- OSRM Web Request ---
+        from app.agents.web_search import fetch_routing_info_web
+        
+        web_route_1 = await fetch_routing_info_web(
+            vehicle.current_lat, vehicle.current_lng, 
             emergency.patient_lat, emergency.patient_lng
-        ) * 1.3
-
-        # Leg 2: Patient → Hospital
-        dist_to_hospital = haversine_km(
-            emergency.patient_lat, emergency.patient_lng,
+        )
+        web_route_2 = await fetch_routing_info_web(
+            emergency.patient_lat, emergency.patient_lng, 
             hospital.lat, hospital.lng
-        ) * 1.3
+        )
 
+        if web_route_1 and web_route_2:
+            dist_to_patient = web_route_1["distance_km"]
+            dist_to_hospital = web_route_2["distance_km"]
+            base_duration = web_route_1["duration_mins"] + web_route_2["duration_mins"]
+            eta_mins = max(2, round(base_duration * effective_mult))
+            source_info = "OSRM Routing API"
+        else:
+            # Fallback to Haversine
+            dist_to_patient = haversine_km(
+                vehicle.current_lat, vehicle.current_lng,
+                emergency.patient_lat, emergency.patient_lng
+            ) * 1.3
+
+            dist_to_hospital = haversine_km(
+                emergency.patient_lat, emergency.patient_lng,
+                hospital.lat, hospital.lng
+            ) * 1.3
+            source_info = "Haversine Distance"
+            total_dist_km = dist_to_patient + dist_to_hospital
+            eta_mins = max(2, round((total_dist_km / base_speed_kmh) * 60 * effective_mult))
+            
         total_dist_km = dist_to_patient + dist_to_hospital
-        eta_mins = max(2, round((total_dist_km / base_speed_kmh) * 60 * effective_mult))
+        
+        # --- End Web Request ---
 
         emergency.estimated_eta_mins = eta_mins
 
@@ -352,10 +422,10 @@ class RouteAgent:
             emergency.fare_npr = fare
 
         reasoning = (
+            f"Routing Source: {source_info}. "
             f"Leg 1 (vehicle→patient): {dist_to_patient:.2f} km. "
             f"Leg 2 (patient→hospital): {dist_to_hospital:.2f} km. "
             f"Total: {total_dist_km:.2f} km. "
-            f"Base speed: {base_speed_kmh} km/h (siren). "
             f"Traffic multiplier: {traffic_mult} (hour={datetime.utcnow().hour} UTC). "
             f"Effective multiplier: {effective_mult:.2f}. "
             f"ETA: {eta_mins} min."
@@ -367,7 +437,7 @@ class RouteAgent:
             agent_name="ROUTE_AGENT",
             decision=f"ETA {eta_mins} min | Total {total_dist_km:.1f} km" + (f" | NPR {fare}" if fare else ""),
             reasoning=reasoning,
-            confidence=0.88,
+            confidence=0.95 if source_info == "OSRM Routing API" else 0.88,
             decision_hash=_make_hash(emergency.id, "ROUTE_AGENT"),
         )
         db.add(log)

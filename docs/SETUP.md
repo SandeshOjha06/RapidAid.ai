@@ -1,5 +1,23 @@
 # RapidAid.ai Backend Setup Guide
 
+## Project Layout
+
+```
+backend/
+├── main.py              ← FastAPI entry point (run uvicorn from here)
+├── requirements.txt
+├── .env / .env.example
+├── envir/               ← Python virtualenv (single, use this)
+├── rapidaid.db          ← SQLite dev database (auto-created)
+└── app/
+    ├── database.py
+    ├── core/config.py
+    ├── models/          ← ORM + Pydantic schemas
+    ├── agents/          ← 5-agent pipeline
+    ├── routers/         ← REST API + auth
+    └── websockets/      ← WebSocket manager
+```
+
 ## Prerequisites
 
 - **Python 3.10+**
@@ -58,14 +76,19 @@ EOF
 ### Terminal 1: FastAPI Server
 
 ```bash
-uvicorn app.main:app --reload --port 8000
+cd backend
+envir/bin/uvicorn main:app --reload --port 8000
 ```
+
+> **Note:** `main.py` lives at `backend/main.py` (not inside `app/`),
+> so the module is `main:app` — not `app.main:app`.
 
 You should see:
 ```
-🚀 RapidAid.ai started on http://localhost:8000
-📚 Swagger UI: http://localhost:8000/docs
-🔧 ReDoc: http://localhost:8000/redoc
+🚀 RapidAid.ai started → http://localhost:8000
+   📚 Swagger UI  : http://localhost:8000/docs
+   🔧 ReDoc       : http://localhost:8000/redoc
+   🧠 Triage mode : 📋 Rule-based triage ...
 ✅ Demo data seeded
 ```
 
@@ -178,16 +201,18 @@ uvicorn app.main:app --reload --port 8001
 POST /emergency/sos
     ↓
 AgentPipeline.process_sos()
-    ├─► [1] TriageAgent: Keywords → Severity + Category
-    ├─► [2] HospitalAgent: Find best hospital
-    ├─► [3] DispatchAgent: Find closest vehicle
-    └─► [4] RouteAgent: Calculate ETA + fare
+    ├─► [1] SmartTriageAgent  → Gemini 1.5 Flash (falls back to rule-based)
+    ├─► [2] HospitalAgent     → Nearest capable hospital
+    ├─► [3] NegotiationAgent  → Confirm capacity, re-route if full
+    ├─► [4] DispatchAgent     → Nearest available ambulance (tier-aware)
+    └─► [5] RouteAgent        → ETA + fare (Kathmandu traffic profile)
     ↓
-DB COMMIT (atomic)
+DB COMMIT (atomic, owned by router)
     ↓
 WebSocket broadcasts:
-    → Hospital: "INCOMING P1_CRITICAL"
-    → Driver: "Emergency assigned"
+    → Hospital: "INCOMING_PATIENT"
+    → Driver:   "ASSIGNMENT"
+    → Patient:  "STATUS_UPDATE"
 ```
 
 ## Key Endpoints
@@ -216,7 +241,8 @@ See `.env.example` for all options:
 
 ## Next Steps
 
-- Set up Next.js frontend (see main README)
-- Deploy to production (change SECRET_KEY, DEBUG=False)
+- Set up Next.js frontend: `cd frontend && npm run dev`
+- Add `GEMINI_API_KEY` to `backend/.env` to enable AI-powered triage
+- Deploy to production (set `DEBUG=False`, change `SECRET_KEY`)
 - Implement YOLO11 image processing (Phase 2)
-- Add OTP authentication
+- Add OTP SMS authentication (Phase 2)
