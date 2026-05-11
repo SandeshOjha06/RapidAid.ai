@@ -3,8 +3,8 @@ from typing import List
 
 class Settings(BaseSettings):
     # Use SQLite for development/testing, PostgreSQL for production
-    DATABASE_URL: str = "sqlite+aiosqlite:///./rapidaid.db"
-    SYNC_DATABASE_URL: str = "sqlite:///./rapidaid.db"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:password@localhost/rapidaid"
+    SYNC_DATABASE_URL: str = "postgresql://postgres:password@localhost/rapidaid"
     SECRET_KEY: str = "dev-secret-key-change-in-production-32chars!!"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
