@@ -29,7 +29,7 @@ wheels/
 # Never commit your secrets
 .env
 .env.*
-.env.example
+/backend/.env.example
 
 # --- FastAPI/Project Specific ---
 # If using database migrations (e.g., Alembic)
